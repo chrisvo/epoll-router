@@ -4,6 +4,47 @@
 
 The goal is simple: keep inference workers behind NAT or private networks, let them dial out to a central router, and expose a normal OpenAI-compatible-ish HTTP API to clients.
 
+## Why This Exists
+
+Most LLM gateways assume the gateway can reach every upstream inference endpoint over normal HTTP. That works well for cloud providers, Kubernetes services, and public or VPN-accessible vLLM/TGI deployments.
+
+`epoll-router` is for a different shape:
+
+```text
+private GPU machine behind NAT/firewall
+  |
+  | outbound WebSocket
+  v
+public router with OpenAI-compatible API
+```
+
+The real use case is a reverse-connected inference mesh: run LLM workers anywhere without opening inbound ports, then route inference to them through one public API.
+
+This is useful for:
+
+- Internal GPU workstations that should not expose public HTTP servers.
+- On-prem or regulated environments where inference must happen inside a private network.
+- Edge inference nodes in stores, labs, factories, clinics, or appliances.
+- Ephemeral GPU capacity from spot instances, rented machines, homelab boxes, or developer laptops.
+- Bring-your-own-compute products where a SaaS control plane dispatches jobs to customer-owned workers.
+
+This project is not trying to replace vLLM, TGI, llama.cpp, or LiteLLM. A more realistic production role is:
+
+```text
+client / OpenAI SDK
+  |
+  v
+LLM gateway or app backend
+  |
+  v
+epoll-router reverse worker fabric
+  |
+  v
+private vLLM / TGI / llama.cpp / MLX workers
+```
+
+The killer demo is: run the router on a VPS, run a worker on a laptop behind home NAT, wrap a local inference backend, and call one OpenAI-compatible endpoint from anywhere without opening an inbound port on the laptop.
+
 ## What Works
 
 - Router HTTP API at `/v1/chat/completions`
