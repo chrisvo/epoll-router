@@ -54,6 +54,25 @@ approved local capabilities
 
 The first runnable prototype still uses an OpenAI-compatible-ish chat endpoint and a mock streaming worker. That is the first vertical slice of the routing path, not the full product boundary.
 
+## Related Approaches
+
+This sits near several existing categories, but the intended boundary is different.
+
+**Network tunnels and VPNs** such as Tailscale, WireGuard, and Cloudflare Tunnel provide private network reachability. `epoll-router` is not trying to be a better VPN. The distinction is capability access instead of network access: a hosted agent can request `run_tests`, but it does not receive broad access to the private network.
+
+**Self-hosted CI runners** such as GitHub Actions runners, Buildkite agents, and Jenkins agents execute predefined workflows from repo or pipeline events. `epoll-router` is agent-facing and interactive: a hosted agent requests a bounded capability during its reasoning loop and receives structured context back.
+
+**Self-hosted agent environments** run more of the AI agent stack inside customer infrastructure. That can be the right answer for enterprises that want full local execution. `epoll-router` is smaller: it lets a hosted agent delegate specific approved work to private workers without moving the whole agent runtime.
+
+**MCP servers and tool connectors** expose tools to agents. `epoll-router` is complementary: it can act as the reverse-connected private worker layer underneath agent tool protocols when the tool server cannot or should not be publicly reachable.
+
+The target niche is:
+
+```text
+open-source, vendor-neutral, capability-scoped private workers
+for hosted AI agents
+```
+
 ## What Works
 
 - Router HTTP API at `/v1/chat/completions`
