@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use epoll_router::protocol::{
-    Envelope, JobDelta, JobError, JobFinish, ModelCapability, WorkerPayload, WorkerRegister,
-    WorkerTelemetry,
+    CapabilityDelta, CapabilityDescriptor, CapabilityError, CapabilityFinish, Envelope, JobDelta,
+    JobError, JobFinish, ModelCapability, WorkerPayload, WorkerRegister, WorkerTelemetry,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio::time;
@@ -59,6 +59,18 @@ async fn run_worker(
             aliases: vec!["local-default".to_string(), "fast".to_string()],
             max_context_tokens: 8192,
             supports_streaming: true,
+        }],
+        capabilities: vec![CapabilityDescriptor {
+            name: "run_echo".to_string(),
+            description: "Echoes the provided input from inside the private worker.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            }),
+            streams: true,
         }],
     };
     send(
@@ -131,6 +143,68 @@ async fn run_worker(
                                 WorkerPayload::JobFinish(JobFinish {
                                     job_id: job.job_id,
                                     finish_reason: "stop".to_string(),
+                                }),
+                            ),
+                        ).await?;
+                        active_jobs = active_jobs.saturating_sub(1);
+                    }
+                    ("capability.start", WorkerPayload::CapabilityStart(job)) => {
+                        active_jobs += 1;
+                        info!(
+                            job_id = %job.job_id,
+                            capability = %job.capability,
+                            "mock capability started"
+                        );
+
+                        if job.capability != "run_echo" {
+                            send(
+                                &mut write,
+                                Envelope::new(
+                                    "capability.error",
+                                    format!("msg_{}", Uuid::new_v4()),
+                                    WorkerPayload::CapabilityError(CapabilityError {
+                                        job_id: job.job_id,
+                                        message: "unsupported capability".to_string(),
+                                    }),
+                                ),
+                            ).await?;
+                            active_jobs = active_jobs.saturating_sub(1);
+                            continue;
+                        }
+
+                        let message = job
+                            .input
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("");
+                        let response = format!("private worker echo: {message}");
+
+                        for token in response.split_inclusive(' ') {
+                            send(
+                                &mut write,
+                                Envelope::new(
+                                    "capability.delta",
+                                    format!("msg_{}", Uuid::new_v4()),
+                                    WorkerPayload::CapabilityDelta(CapabilityDelta {
+                                        job_id: job.job_id.clone(),
+                                        data: serde_json::json!({ "chunk": token }),
+                                    }),
+                                ),
+                            ).await?;
+                            time::sleep(Duration::from_millis(120)).await;
+                        }
+
+                        send(
+                            &mut write,
+                            Envelope::new(
+                                "capability.finish",
+                                format!("msg_{}", Uuid::new_v4()),
+                                WorkerPayload::CapabilityFinish(CapabilityFinish {
+                                    job_id: job.job_id,
+                                    output: serde_json::json!({
+                                        "message": response,
+                                        "worker": worker_id
+                                    }),
                                 }),
                             ),
                         ).await?;

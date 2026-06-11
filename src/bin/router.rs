@@ -10,7 +10,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{
-        State, WebSocketUpgrade,
+        Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
@@ -21,11 +21,13 @@ use axum::{
     routing::{get, post},
 };
 use epoll_router::protocol::{
+    CapabilityDelta, CapabilityDescriptor, CapabilityError, CapabilityFinish, CapabilityJob,
     ChatMessage, Envelope, InferenceJob, JobDelta, JobError, JobFinish, ModelCapability, Sampling,
     WorkerPayload, WorkerRegister, WorkerTelemetry,
 };
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -46,6 +48,7 @@ struct RouterState {
 struct ConnectedWorker {
     worker_id: String,
     models: Vec<ModelCapability>,
+    capabilities: Vec<CapabilityDescriptor>,
     max_inflight: usize,
     active_jobs: usize,
     healthy: bool,
@@ -60,8 +63,16 @@ struct PendingJob {
 #[derive(Debug)]
 enum RouterEvent {
     Delta(String),
+    Data(Value),
     Done,
+    Output(Value),
     Error(String),
+}
+
+#[derive(Clone, Copy)]
+enum SseFormat {
+    Chat,
+    Capability,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +104,21 @@ struct ChatChoice {
     finish_reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CapabilityRequest {
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CapabilityResponse {
+    id: String,
+    capability: String,
+    output: Value,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -112,6 +138,7 @@ async fn main() {
         .route("/healthz", get(|| async { "ok" }))
         .route("/workers/socket", get(worker_socket))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/capabilities/{capability}", post(capability_request))
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("ROUTER_ADDR")
@@ -163,9 +190,12 @@ async fn chat_completions(
     }
 
     if request.stream {
-        Sse::new(SseStream { rx: stream_rx })
-            .keep_alive(KeepAlive::default())
-            .into_response()
+        Sse::new(SseStream {
+            rx: stream_rx,
+            format: SseFormat::Chat,
+        })
+        .keep_alive(KeepAlive::default())
+        .into_response()
     } else {
         let content = collect_non_streaming(stream_rx).await;
         Json(ChatCompletionResponse {
@@ -180,6 +210,52 @@ async fn chat_completions(
                 },
                 finish_reason: "stop".to_string(),
             }],
+        })
+        .into_response()
+    }
+}
+
+async fn capability_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(capability): Path<String>,
+    Json(request): Json<CapabilityRequest>,
+) -> impl IntoResponse {
+    let Some(client_id) = authenticate(&headers, &state.client_keys) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid client bearer token",
+        )
+            .into_response();
+    };
+
+    let job_id = format!("cap_{}", Uuid::new_v4());
+    let job = CapabilityJob {
+        job_id: job_id.clone(),
+        capability: capability.clone(),
+        input: request.input,
+        stream: request.stream,
+    };
+
+    let (stream_tx, stream_rx) = mpsc::channel::<RouterEvent>(64);
+    match dispatch_capability(state.clone(), &job_id, job, stream_tx).await {
+        Ok(()) => info!(%client_id, %job_id, %capability, "capability job dispatched"),
+        Err(err) => return (StatusCode::SERVICE_UNAVAILABLE, err).into_response(),
+    }
+
+    if request.stream {
+        Sse::new(SseStream {
+            rx: stream_rx,
+            format: SseFormat::Capability,
+        })
+        .keep_alive(KeepAlive::default())
+        .into_response()
+    } else {
+        let output = collect_capability_output(stream_rx).await;
+        Json(CapabilityResponse {
+            id: job_id,
+            capability,
+            output,
         })
         .into_response()
     }
@@ -228,16 +304,78 @@ async fn dispatch_job(
     Ok(())
 }
 
+async fn dispatch_capability(
+    state: AppState,
+    job_id: &str,
+    job: CapabilityJob,
+    stream_tx: mpsc::Sender<RouterEvent>,
+) -> Result<(), String> {
+    let mut guard = state.inner.lock().await;
+    let Some(worker) = guard.workers.values_mut().find(|worker| {
+        worker.healthy
+            && worker.active_jobs < worker.max_inflight
+            && worker
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == job.capability)
+    }) else {
+        return Err("no healthy worker has capacity for requested capability".to_string());
+    };
+
+    worker.active_jobs += 1;
+    let worker_id = worker.worker_id.clone();
+    let tx = worker.tx.clone();
+    guard.pending_jobs.insert(
+        job_id.to_string(),
+        PendingJob {
+            worker_id,
+            tx: stream_tx,
+        },
+    );
+    drop(guard);
+
+    let envelope = Envelope::new(
+        "capability.start",
+        job_id.to_string(),
+        WorkerPayload::CapabilityStart(job),
+    );
+    if tx.send(envelope).await.is_err() {
+        let mut guard = state.inner.lock().await;
+        guard.pending_jobs.remove(job_id);
+        return Err("selected worker disconnected before dispatch".to_string());
+    }
+
+    Ok(())
+}
+
 async fn collect_non_streaming(mut rx: mpsc::Receiver<RouterEvent>) -> String {
     let mut content = String::new();
     while let Some(event) = rx.recv().await {
         match event {
             RouterEvent::Delta(delta) => content.push_str(&delta),
+            RouterEvent::Data(data) => content.push_str(&data.to_string()),
             RouterEvent::Done => break,
+            RouterEvent::Output(output) => content.push_str(&output.to_string()),
             RouterEvent::Error(_) => break,
         }
     }
     content
+}
+
+async fn collect_capability_output(mut rx: mpsc::Receiver<RouterEvent>) -> Value {
+    let mut deltas = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            RouterEvent::Data(data) => deltas.push(data),
+            RouterEvent::Output(output) => return output,
+            RouterEvent::Done => return Value::Array(deltas),
+            RouterEvent::Error(message) => {
+                return serde_json::json!({ "error": { "message": message } });
+            }
+            RouterEvent::Delta(delta) => deltas.push(Value::String(delta)),
+        }
+    }
+    Value::Array(deltas)
 }
 
 async fn worker_socket(
@@ -319,6 +457,15 @@ async fn handle_worker_socket(state: AppState, authorized_worker_id: String, soc
             ("job.error", WorkerPayload::JobError(err)) => {
                 fail_job(&state, err).await;
             }
+            ("capability.delta", WorkerPayload::CapabilityDelta(delta)) => {
+                forward_capability_delta(&state, delta).await;
+            }
+            ("capability.finish", WorkerPayload::CapabilityFinish(finish)) => {
+                finish_capability(&state, finish).await;
+            }
+            ("capability.error", WorkerPayload::CapabilityError(err)) => {
+                fail_capability(&state, err).await;
+            }
             _ => warn!(kind = %envelope.kind, "unexpected worker message"),
         }
     }
@@ -338,6 +485,7 @@ async fn register_worker(
     info!(
         worker_id = %register.worker_id,
         models = register.models.len(),
+        capabilities = register.capabilities.len(),
         max_inflight = register.max_inflight,
         "worker registered"
     );
@@ -346,12 +494,49 @@ async fn register_worker(
         ConnectedWorker {
             worker_id: register.worker_id,
             models: register.models,
+            capabilities: register.capabilities,
             max_inflight: register.max_inflight.max(1),
             active_jobs: 0,
             healthy: true,
             tx,
         },
     );
+}
+
+async fn forward_capability_delta(state: &AppState, delta: CapabilityDelta) {
+    let tx = {
+        let guard = state.inner.lock().await;
+        guard
+            .pending_jobs
+            .get(&delta.job_id)
+            .map(|pending| pending.tx.clone())
+    };
+    if let Some(tx) = tx {
+        let _ = tx.send(RouterEvent::Data(delta.data)).await;
+    }
+}
+
+async fn finish_capability(state: &AppState, finish: CapabilityFinish) {
+    let pending = {
+        let mut guard = state.inner.lock().await;
+        guard.pending_jobs.remove(&finish.job_id)
+    };
+    if let Some(pending) = pending {
+        decrement_worker_active(state, &pending.worker_id).await;
+        let _ = pending.tx.send(RouterEvent::Output(finish.output)).await;
+        let _ = pending.tx.send(RouterEvent::Done).await;
+    }
+}
+
+async fn fail_capability(state: &AppState, err: CapabilityError) {
+    let pending = {
+        let mut guard = state.inner.lock().await;
+        guard.pending_jobs.remove(&err.job_id)
+    };
+    if let Some(pending) = pending {
+        decrement_worker_active(state, &pending.worker_id).await;
+        let _ = pending.tx.send(RouterEvent::Error(err.message)).await;
+    }
 }
 
 async fn update_worker_telemetry(state: &AppState, worker_id: &str, telemetry: WorkerTelemetry) {
@@ -431,6 +616,7 @@ fn parse_keys(var: &str, default: &str) -> HashMap<String, String> {
 
 struct SseStream {
     rx: mpsc::Receiver<RouterEvent>,
+    format: SseFormat,
 }
 
 impl Stream for SseStream {
@@ -439,15 +625,28 @@ impl Stream for SseStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(RouterEvent::Delta(content))) => {
-                let data = serde_json::json!({
-                    "choices": [{
-                        "delta": { "content": content }
-                    }]
-                });
+                let data = match self.format {
+                    SseFormat::Chat => serde_json::json!({
+                        "choices": [{
+                            "delta": { "content": content }
+                        }]
+                    }),
+                    SseFormat::Capability => serde_json::json!({
+                        "delta": content
+                    }),
+                };
+                Poll::Ready(Some(Ok(Event::default().data(data.to_string()))))
+            }
+            Poll::Ready(Some(RouterEvent::Data(data))) => {
                 Poll::Ready(Some(Ok(Event::default().data(data.to_string()))))
             }
             Poll::Ready(Some(RouterEvent::Done)) => {
                 Poll::Ready(Some(Ok(Event::default().data("[DONE]"))))
+            }
+            Poll::Ready(Some(RouterEvent::Output(output))) => {
+                Poll::Ready(Some(Ok(Event::default()
+                    .event("output")
+                    .data(output.to_string()))))
             }
             Poll::Ready(Some(RouterEvent::Error(message))) => {
                 let data = serde_json::json!({ "error": { "message": message } });

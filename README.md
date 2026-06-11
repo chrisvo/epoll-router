@@ -57,6 +57,7 @@ The first runnable prototype still uses an OpenAI-compatible-ish chat endpoint a
 ## What Works
 
 - Router HTTP API at `/v1/chat/completions`
+- General capability API at `/v1/capabilities/{capability}`
 - SSE streaming responses for `stream: true`
 - Non-streaming JSON responses for `stream: false`
 - Worker outbound WebSocket at `/workers/socket`
@@ -65,6 +66,7 @@ The first runnable prototype still uses an OpenAI-compatible-ish chat endpoint a
 - Worker registration with model-like capabilities and aliases
 - Worker telemetry updates
 - In-memory routing to one healthy, available worker
+- Mock `run_echo` capability
 - Mock worker that streams fake token deltas
 
 ## Architecture
@@ -136,7 +138,34 @@ curl http://127.0.0.1:3000/v1/chat/completions \
     "messages": [
       { "role": "user", "content": "non stream check" }
     ]
+}'
+```
+
+Send a streaming capability request:
+
+```sh
+curl -N http://127.0.0.1:3000/v1/capabilities/run_echo \
+  -H 'Authorization: Bearer dev-client-token' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "stream": true,
+    "input": {
+      "message": "hello private worker"
+    }
   }'
+```
+
+Expected response shape:
+
+```text
+data: {"chunk":"private "}
+
+data: {"chunk":"worker "}
+
+event: output
+data: {"message":"private worker echo: hello private worker","worker":"mock-worker"}
+
+data: [DONE]
 ```
 
 ## Configuration
@@ -181,10 +210,18 @@ Current message types:
 - `job.delta`
 - `job.finish`
 - `job.error`
+- `capability.start`
+- `capability.delta`
+- `capability.finish`
+- `capability.error`
 
 ## Capability Routing
 
-Workers should eventually advertise named capabilities with bounded input/output contracts. The current prototype models this as model routing: workers advertise concrete model ids and aliases, and the router accepts either:
+Workers advertise named capabilities with bounded input/output contracts. The mock worker currently advertises:
+
+- `run_echo`
+
+The chat-completion prototype still models local inference as model routing: workers advertise concrete model ids and aliases, and the router accepts either:
 
 - a concrete model id, such as `mock-llm`
 - an alias, such as `local-default` or `fast`
@@ -199,7 +236,7 @@ This is a prototype, not production infrastructure.
 - There is no durable queue.
 - There is no retry after a stream has started.
 - There is no real inference backend yet.
-- There is no general capability API yet.
+- There is only one mock capability.
 - There is no cancellation propagation yet.
 - The OpenAI-compatible API is intentionally small.
 - Routing is first-match, not latency/cost optimized.
@@ -208,7 +245,7 @@ This is a prototype, not production infrastructure.
 
 - Add cancellation when the client disconnects.
 - Add request and protocol validation tests.
-- Add a general capability request API.
+- Add real capabilities such as `run_tests`, `read_logs`, and `query_deploy_status`.
 - Add a real worker adapter for `llama.cpp`, vLLM, or TGI.
 - Add queue limits and per-client in-flight limits.
 - Add Prometheus/OpenTelemetry metrics.

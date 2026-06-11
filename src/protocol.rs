@@ -31,6 +31,10 @@ pub enum WorkerPayload {
     JobDelta(JobDelta),
     JobFinish(JobFinish),
     JobError(JobError),
+    CapabilityStart(CapabilityJob),
+    CapabilityDelta(CapabilityDelta),
+    CapabilityFinish(CapabilityFinish),
+    CapabilityError(CapabilityError),
     Empty {},
 }
 
@@ -38,6 +42,8 @@ pub enum WorkerPayload {
 pub struct WorkerRegister {
     pub worker_id: String,
     pub models: Vec<ModelCapability>,
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityDescriptor>,
     pub max_inflight: usize,
     pub engine: String,
 }
@@ -48,6 +54,14 @@ pub struct ModelCapability {
     pub aliases: Vec<String>,
     pub max_context_tokens: usize,
     pub supports_streaming: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub streams: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +108,32 @@ pub struct JobFinish {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobError {
+    pub job_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityJob {
+    pub job_id: String,
+    pub capability: String,
+    pub input: serde_json::Value,
+    pub stream: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDelta {
+    pub job_id: String,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityFinish {
+    pub job_id: String,
+    pub output: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityError {
     pub job_id: String,
     pub message: String,
 }
