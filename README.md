@@ -1,49 +1,58 @@
 # epoll-router
 
-`epoll-router` is a prototype LLM inference router for self-hosted workers that connect outbound over a persistent WebSocket, similar in spirit to Slack Socket Mode.
+`epoll-router` is a prototype reverse-connected capability router for hosted AI agents.
 
-The goal is simple: keep inference workers behind NAT or private networks, let them dial out to a central router, and expose a normal OpenAI-compatible-ish HTTP API to clients.
+Think: a self-hosted runner for AI agents. Private workers connect outbound over a persistent WebSocket, advertise approved capabilities, and perform agent-requested work without exposing inbound network endpoints.
 
 ## Why This Exists
 
-Most LLM gateways assume the gateway can reach every upstream inference endpoint over normal HTTP. That works well for cloud providers, Kubernetes services, and public or VPN-accessible vLLM/TGI deployments.
+Hosted AI agents are most useful when they can inspect, test, and operate against real private environments. But giving a hosted agent broad SSH, VPN, database, or VPC access is usually the wrong trust boundary.
 
-`epoll-router` is for a different shape:
+`epoll-router` is for trust-bounded delegation:
 
 ```text
-private GPU machine behind NAT/firewall
+hosted AI agent
   |
-  | outbound WebSocket
+  | request approved capability
   v
-public router with OpenAI-compatible API
+public router
+  |
+  | already-open outbound WebSocket
+  v
+private agent worker
+  |
+  | performs work locally
+  v
+private repo / service / logs / model
 ```
 
-The real use case is a reverse-connected inference mesh: run LLM workers anywhere without opening inbound ports, then route inference to them through one public API.
+The hosted agent does not get general network reachability. It can only request named capabilities that the private worker advertised.
 
 This is useful for:
 
-- Internal GPU workstations that should not expose public HTTP servers.
-- On-prem or regulated environments where inference must happen inside a private network.
-- Edge inference nodes in stores, labs, factories, clinics, or appliances.
-- Ephemeral GPU capacity from spot instances, rented machines, homelab boxes, or developer laptops.
-- Bring-your-own-compute products where a SaaS control plane dispatches jobs to customer-owned workers.
+- Running tests in a private repo without uploading the whole environment.
+- Reading redacted logs from inside a VPC.
+- Querying internal deployment status through a bounded tool.
+- Calling private APIs without giving the hosted agent raw credentials.
+- Running local inference as one capability among many.
+- Building bring-your-own-compute agent products where work executes inside customer infrastructure.
 
-This project is not trying to replace vLLM, TGI, llama.cpp, or LiteLLM. A more realistic production role is:
+This project is not trying to replace SSH, VPNs, CI runners, vLLM, TGI, llama.cpp, or LiteLLM. The more specific role is:
 
 ```text
-client / OpenAI SDK
+hosted AI agent
   |
   v
-LLM gateway or app backend
+epoll-router
   |
   v
-epoll-router reverse worker fabric
+private agent worker
   |
   v
-private vLLM / TGI / llama.cpp / MLX workers
+approved local capabilities
 ```
 
-The killer demo is: run the router on a VPS, run a worker on a laptop behind home NAT, wrap a local inference backend, and call one OpenAI-compatible endpoint from anywhere without opening an inbound port on the laptop.
+The first runnable prototype still uses an OpenAI-compatible-ish chat endpoint and a mock streaming worker. That is the first vertical slice of the routing path, not the full product boundary.
 
 ## What Works
 
@@ -53,7 +62,7 @@ The killer demo is: run the router on a VPS, run a worker on a laptop behind hom
 - Worker outbound WebSocket at `/workers/socket`
 - JSON message envelope with protocol version and message type
 - Bearer-token auth for clients and workers
-- Worker registration with model capabilities and aliases
+- Worker registration with model-like capabilities and aliases
 - Worker telemetry updates
 - In-memory routing to one healthy, available worker
 - Mock worker that streams fake token deltas
@@ -61,18 +70,18 @@ The killer demo is: run the router on a VPS, run a worker on a laptop behind hom
 ## Architecture
 
 ```text
-client
+hosted agent or app
   |
-  | HTTP POST /v1/chat/completions
+  | request capability
   v
 router
   |
   | outbound worker WebSocket, already connected
   v
-self-hosted worker
+private agent worker
 ```
 
-Clients use a conventional HTTP interface. Workers maintain persistent outbound WebSocket connections to the router, register their capabilities, receive jobs, and stream deltas back.
+Clients use a conventional HTTP interface. Workers maintain persistent outbound WebSocket connections to the router, register their capabilities, receive jobs, and stream results back.
 
 This lets workers run on machines that do not expose public inbound ports.
 
@@ -173,14 +182,14 @@ Current message types:
 - `job.finish`
 - `job.error`
 
-## Model Routing
+## Capability Routing
 
-Workers advertise concrete model ids and aliases. The router currently accepts either:
+Workers should eventually advertise named capabilities with bounded input/output contracts. The current prototype models this as model routing: workers advertise concrete model ids and aliases, and the router accepts either:
 
 - a concrete model id, such as `mock-llm`
 - an alias, such as `local-default` or `fast`
 
-The first healthy worker with matching capacity receives the job.
+The first healthy worker with matching capacity receives the job. In the intended product shape, `run_tests`, `read_logs`, `query_deploy_status`, and `run_local_model` are all capabilities.
 
 ## Current Limitations
 
@@ -190,6 +199,7 @@ This is a prototype, not production infrastructure.
 - There is no durable queue.
 - There is no retry after a stream has started.
 - There is no real inference backend yet.
+- There is no general capability API yet.
 - There is no cancellation propagation yet.
 - The OpenAI-compatible API is intentionally small.
 - Routing is first-match, not latency/cost optimized.
@@ -198,6 +208,7 @@ This is a prototype, not production infrastructure.
 
 - Add cancellation when the client disconnects.
 - Add request and protocol validation tests.
+- Add a general capability request API.
 - Add a real worker adapter for `llama.cpp`, vLLM, or TGI.
 - Add queue limits and per-client in-flight limits.
 - Add Prometheus/OpenTelemetry metrics.
